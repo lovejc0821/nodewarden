@@ -295,6 +295,37 @@ function buildPublicSendUrl(origin: string, accessId: string, keyPart: string): 
   return `${origin}/#/send/${accessId}/${keyPart}`;
 }
 
+const SIGNALR_RECORD_SEPARATOR = String.fromCharCode(0x1e);
+
+interface WebVaultSignalRInvocation {
+  type?: number;
+  target?: string;
+  arguments?: Array<{
+    ContextId?: string | null;
+    Type?: number;
+    Payload?: {
+      UserId?: string;
+      Date?: string;
+      RevisionDate?: string;
+    };
+  }>;
+}
+
+function parseSignalRTextFrames(raw: string): WebVaultSignalRInvocation[] {
+  return raw
+    .split(SIGNALR_RECORD_SEPARATOR)
+    .map((frame) => frame.trim())
+    .filter(Boolean)
+    .map((frame) => {
+      try {
+        return JSON.parse(frame) as WebVaultSignalRInvocation;
+      } catch {
+        return null;
+      }
+    })
+    .filter((frame): frame is WebVaultSignalRInvocation => !!frame);
+}
+
 async function deriveSendKeyParts(sendKeyMaterial: Uint8Array): Promise<{ enc: Uint8Array; mac: Uint8Array }> {
   if (sendKeyMaterial.length >= 64) {
     return { enc: sendKeyMaterial.slice(0, 32), mac: sendKeyMaterial.slice(32, 64) };
@@ -344,6 +375,7 @@ export default function App() {
   const [decryptedCiphers, setDecryptedCiphers] = useState<Cipher[]>([]);
   const [decryptedSends, setDecryptedSends] = useState<Send[]>([]);
   const migratedPlainFolderIdsRef = useRef<Set<string>>(new Set());
+  const silentRefreshVaultRef = useRef<() => Promise<void>>(async () => {});
 
   useEffect(() => {
     const syncInviteFromUrl = () => {
@@ -952,6 +984,101 @@ export default function App() {
     await Promise.all([ciphersQuery.refetch(), foldersQuery.refetch(), sendsQuery.refetch()]);
     pushToast('success', t('txt_vault_synced'));
   }
+
+  async function refreshVaultSilently() {
+    await Promise.all([ciphersQuery.refetch(), foldersQuery.refetch(), sendsQuery.refetch()]);
+  }
+
+  silentRefreshVaultRef.current = refreshVaultSilently;
+
+  useEffect(() => {
+    if (phase !== 'app' || !session?.accessToken || !session?.symEncKey || !session?.symMacKey) return;
+
+    let disposed = false;
+    let socket: WebSocket | null = null;
+    let reconnectTimer: number | null = null;
+    let reconnectAttempts = 0;
+
+    const clearReconnectTimer = () => {
+      if (reconnectTimer !== null) {
+        window.clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+    };
+
+    const scheduleReconnect = () => {
+      if (disposed) return;
+      clearReconnectTimer();
+      const delay = Math.min(10000, 1000 * Math.max(1, reconnectAttempts + 1));
+      reconnectAttempts += 1;
+      reconnectTimer = window.setTimeout(() => {
+        reconnectTimer = null;
+        connect();
+      }, delay);
+    };
+
+    const connect = () => {
+      if (disposed) return;
+      try {
+        const hubUrl = new URL('/notifications/hub', window.location.origin);
+        hubUrl.searchParams.set('access_token', session.accessToken);
+        hubUrl.protocol = hubUrl.protocol === 'https:' ? 'wss:' : 'ws:';
+        socket = new WebSocket(hubUrl.toString());
+      } catch {
+        scheduleReconnect();
+        return;
+      }
+
+      socket.addEventListener('open', () => {
+        reconnectAttempts = 0;
+        try {
+          socket?.send(`{"protocol":"json","version":1}${SIGNALR_RECORD_SEPARATOR}`);
+        } catch {
+          socket?.close();
+        }
+      });
+
+      socket.addEventListener('message', (event) => {
+        if (disposed) return;
+        if (typeof event.data !== 'string') return;
+
+        const frames = parseSignalRTextFrames(event.data);
+        for (const frame of frames) {
+          if (frame.type !== 1 || frame.target !== 'ReceiveMessage') continue;
+          const contextId = String(frame.arguments?.[0]?.ContextId || '').trim();
+          if (contextId && contextId === getCurrentDeviceIdentifier()) continue;
+          void silentRefreshVaultRef.current();
+        }
+      });
+
+      socket.addEventListener('close', () => {
+        socket = null;
+        scheduleReconnect();
+      });
+
+      socket.addEventListener('error', () => {
+        try {
+          socket?.close();
+        } catch {
+          // ignore close races
+        }
+      });
+    };
+
+    connect();
+
+    return () => {
+      disposed = true;
+      clearReconnectTimer();
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        try {
+          socket.close();
+        } catch {
+          // ignore close races
+        }
+      }
+    };
+  }, [phase, session?.accessToken, session?.symEncKey, session?.symMacKey]);
 
   async function refreshAuthorizedDevices() {
     await authorizedDevicesQuery.refetch();

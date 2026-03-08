@@ -1,6 +1,7 @@
 // Environment bindings
 export interface Env {
   DB: D1Database;
+  NOTIFICATIONS_HUB: DurableObjectNamespace;
   // Prefer R2 when available. Optional to support KV-only deployments.
   ATTACHMENTS?: R2Bucket;
   // Optional fallback for attachment/send file storage (no credit card required).

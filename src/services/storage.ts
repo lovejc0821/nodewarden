@@ -504,8 +504,8 @@ export class StorageService {
     });
   }
 
-  async bulkMoveCiphers(ids: string[], folderId: string | null, userId: string): Promise<void> {
-    if (ids.length === 0) return;
+  async bulkMoveCiphers(ids: string[], folderId: string | null, userId: string): Promise<string | null> {
+    if (ids.length === 0) return null;
     const now = new Date().toISOString();
     const uniqueIds = Array.from(new Set(ids));
     const patch = JSON.stringify({
@@ -528,7 +528,7 @@ export class StorageService {
         .run();
     }
 
-    await this.updateRevisionDate(userId);
+    return this.updateRevisionDate(userId);
   }
 
   // --- Folders ---
@@ -744,12 +744,13 @@ export class StorageService {
     await this.db.prepare('DELETE FROM attachments WHERE cipher_id = ?').bind(cipherId).run();
   }
 
-  async updateCipherRevisionDate(cipherId: string): Promise<void> {
+  async updateCipherRevisionDate(cipherId: string): Promise<{ userId: string; revisionDate: string } | null> {
     const cipher = await this.getCipher(cipherId);
-    if (!cipher) return;
+    if (!cipher) return null;
     cipher.updatedAt = new Date().toISOString();
     await this.saveCipher(cipher);
-    await this.updateRevisionDate(cipher.userId);
+    const revisionDate = await this.updateRevisionDate(cipher.userId);
+    return { userId: cipher.userId, revisionDate };
   }
 
   // --- Refresh tokens ---
